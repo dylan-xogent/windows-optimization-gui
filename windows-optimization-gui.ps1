@@ -34,18 +34,35 @@ if (-not $isAdmin) {
     Write-Warning "This script requires administrator privileges. Please run as Administrator!"
     Write-Host "Attempting to elevate..." -ForegroundColor Yellow
     Start-Sleep -Seconds 2
-    
+
     # Try to elevate
     $scriptPath = $MyInvocation.MyCommand.Path
     if (-not $scriptPath) {
         $scriptPath = $PSCommandPath
     }
-    if ($scriptPath) {
-        Start-Process powershell.exe -Verb RunAs -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`""
-    } else {
-        Write-Error "Cannot determine script path. Please run this script directly as Administrator."
+
+    # Handle execution from GitHub (iex/irm)
+    if (-not $scriptPath) {
+        Write-Host "Detected remote execution. Downloading script to temporary location..." -ForegroundColor Yellow
+        $tempScript = "$env:TEMP\WindowsOptimization_$(Get-Date -Format 'yyyyMMddHHmmss').ps1"
+        try {
+            # Download the script content to temp
+            $scriptContent = $MyInvocation.MyCommand.ScriptBlock.ToString()
+            $scriptContent | Out-File -FilePath $tempScript -Encoding UTF8
+            $scriptPath = $tempScript
+        } catch {
+            Write-Error "Cannot save script for elevation. Please download and run locally as Administrator."
+            exit
+        }
     }
-    exit
+
+    if ($scriptPath -and (Test-Path $scriptPath)) {
+        Start-Process powershell.exe -Verb RunAs -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`""
+        exit
+    } else {
+        Write-Error "Cannot determine script path. Please download and run this script directly as Administrator."
+        exit
+    }
 }
 
 # Set error action preference
@@ -55,13 +72,14 @@ $ProgressPreference = "Continue"
 # Application configuration
 $script:AppConfig = @{
     Name = "Windows Optimization Script"
-    Version = "2.0.0"
+    Version = "3.0.0"
     Author = "Windows Optimization Team"
     GitHubRepo = "" # Will be set if launched from GitHub
     LogFile = "$env:TEMP\WindowsOptimization_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
     BackupDir = "$env:USERPROFILE\Documents\WindowsOptimization\Backups"
     ChangesLog = "$env:USERPROFILE\Documents\WindowsOptimization\Changes.log"
     SummaryReport = "$env:USERPROFILE\Documents\WindowsOptimization\OptimizationSummary.txt"
+    HTMLReport = "$env:USERPROFILE\Documents\WindowsOptimization\OptimizationReport.html"
 }
 
 # Create necessary directories
@@ -414,8 +432,8 @@ function New-SystemRestorePoint {
         $result = vssadmin create shadow /For=C: /AutoRetry=1 2>&1
         if ($LASTEXITCODE -eq 0 -or $result -match "successfully") {
             Write-OptimizationLog "System restore point created successfully" "SUCCESS"
-        return $true
-    } else {
+            return $true
+        } else {
             # Alternative method using Checkpoint-Computer (PowerShell 5.1+)
             try {
                 Checkpoint-Computer -Description $Description -RestorePointType "MODIFY_SETTINGS" -ErrorAction Stop
@@ -424,9 +442,9 @@ function New-SystemRestorePoint {
             } catch {
                 Write-OptimizationLog "Failed to create system restore point: $_" "WARNING"
                 Write-OptimizationLog "You may need to enable System Restore manually" "WARNING"
-        return $false
-    }
-}
+                return $false
+            }
+        }
     } catch {
         Write-OptimizationLog "Failed to create system restore point: $_" "ERROR"
         return $false
@@ -437,29 +455,40 @@ function Backup-RegistryKey {
     param(
         [Parameter(Mandatory=$true)]
         [string]$RegistryPath,
-        
+
         [Parameter(Mandatory=$false)]
         [string]$BackupName = ""
     )
-    
+
     if (-not $BackupName) {
         $BackupName = $RegistryPath.Replace('\', '_').Replace(':', '')
     }
-    
+
     $backupFile = Join-Path $script:AppConfig.BackupDir "$BackupName_$(Get-Date -Format 'yyyyMMdd_HHmmss').reg"
-    
+
     try {
-        if (Test-Path $RegistryPath) {
-            reg export $RegistryPath $backupFile /y 2>&1 | Out-Null
+        # Convert PowerShell registry path to reg.exe format
+        $regPath = $RegistryPath -replace '^HKCU:', 'HKEY_CURRENT_USER' -replace '^HKLM:', 'HKEY_LOCAL_MACHINE' -replace '^HKCR:', 'HKEY_CLASSES_ROOT'
+
+        # Test if registry path exists (using proper registry notation)
+        $psPath = $RegistryPath
+        if ($psPath -notmatch '^HK[A-Z]+:') {
+            $psPath = $RegistryPath -replace '^HKEY_CURRENT_USER', 'HKCU:' -replace '^HKEY_LOCAL_MACHINE', 'HKLM:' -replace '^HKEY_CLASSES_ROOT', 'HKCR:'
+        }
+
+        if (Test-Path "Registry::$psPath" -ErrorAction SilentlyContinue) {
+            reg export $regPath $backupFile /y 2>&1 | Out-Null
             if (Test-Path $backupFile) {
                 Write-OptimizationLog "Registry backup created: $backupFile" "DEBUG"
                 return $backupFile
             }
+        } else {
+            Write-OptimizationLog "Registry path does not exist: $RegistryPath (skipping backup)" "DEBUG"
         }
     } catch {
         Write-OptimizationLog "Failed to backup registry key $RegistryPath : $_" "WARNING"
     }
-    
+
     return $null
 }
 
@@ -920,7 +949,7 @@ function Optimize-Memory {
     try {
         # Virtual Memory / Page File optimization
         $ramGB = $SystemSpecs.RAM.TotalGB
-        
+
         if ($ramGB -lt 8) {
             # Low RAM: Set page file to 1.5x RAM
             $pageFileSize = [Math]::Round($ramGB * 1.5 * 1024)
@@ -931,12 +960,48 @@ function Optimize-Memory {
             # Medium RAM: Set page file to 1x RAM
             $pageFileSize = [Math]::Round($ramGB * 1024)
         }
-        
-        # Note: Actual page file configuration requires system restart
-        Write-ChangeLog "Memory" "Configured page file recommendation" "" "$pageFileSize MB recommended"
-        $changes += "Page file optimized"
+
+        # Configure page file using WMI
+        $computerSystem = Get-WmiObject Win32_ComputerSystem -EnableAllPrivileges
+        $currentPageFile = $computerSystem.AutomaticManagedPagefile
+
+        if ($pageFileSize -eq 0) {
+            # Disable page file for very high RAM systems
+            $computerSystem.AutomaticManagedPagefile = $false
+            $computerSystem.Put() | Out-Null
+
+            $pageFile = Get-WmiObject Win32_PageFileSetting -ErrorAction SilentlyContinue
+            if ($pageFile) {
+                $pageFile.Delete()
+            }
+            Write-ChangeLog "Memory" "Disabled page file (high RAM system)" "" "Disabled"
+            $changes += "Page file disabled"
+        } else {
+            # Set custom page file size
+            $computerSystem.AutomaticManagedPagefile = $false
+            $computerSystem.Put() | Out-Null
+
+            # Remove existing page files
+            $existingPageFiles = Get-WmiObject Win32_PageFileSetting -ErrorAction SilentlyContinue
+            if ($existingPageFiles) {
+                foreach ($pf in $existingPageFiles) {
+                    $pf.Delete()
+                }
+            }
+
+            # Create new page file on C: drive
+            $pageFile = ([wmiclass]"Win32_PageFileSetting").CreateInstance()
+            $pageFile.Name = "C:\pagefile.sys"
+            $pageFile.InitialSize = $pageFileSize
+            $pageFile.MaximumSize = $pageFileSize
+            $pageFile.Put() | Out-Null
+
+            Write-ChangeLog "Memory" "Configured page file" "Auto-managed" "$pageFileSize MB (restart required)"
+            $changes += "Page file configured (restart required)"
+        }
     } catch {
-        Write-OptimizationLog "Failed to optimize memory: $_" "WARNING"
+        Write-OptimizationLog "Failed to configure page file: $_" "WARNING"
+        Write-OptimizationLog "You may need to configure page file manually in System Properties" "WARNING"
     }
     
     try {
@@ -1071,6 +1136,530 @@ function Optimize-Startup {
     }
     
     Write-OptimizationLog "Startup optimization completed. Changes: $($changes.Count)" "SUCCESS"
+    return $changes
+}
+
+# Rollback and Restore System
+function Restore-OptimizationBackup {
+    param(
+        [Parameter(Mandatory=$false)]
+        [string]$BackupDate = ""
+    )
+
+    Write-OptimizationLog "Starting system restore process..." "INFO"
+
+    # List available backups
+    $backups = Get-ChildItem -Path $script:AppConfig.BackupDir -Filter "*.json" | Sort-Object LastWriteTime -Descending
+
+    if ($backups.Count -eq 0) {
+        Write-OptimizationLog "No backup files found" "ERROR"
+        return @{ Success = $false; Message = "No backups available" }
+    }
+
+    # Display available backups
+    Write-Host "`nAvailable Backups:" -ForegroundColor Cyan
+    for ($i = 0; $i -lt $backups.Count; $i++) {
+        Write-Host "  $($i+1). $($backups[$i].LastWriteTime) - $($backups[$i].Name)" -ForegroundColor White
+    }
+
+    $selection = Read-Host "`nSelect backup to restore (1-$($backups.Count)) or 0 to cancel"
+    if ($selection -eq "0" -or $selection -lt 1 -or $selection -gt $backups.Count) {
+        Write-OptimizationLog "Restore cancelled by user" "INFO"
+        return @{ Success = $false; Message = "Cancelled" }
+    }
+
+    $selectedBackup = $backups[$selection - 1]
+    Write-Host "`nRestoring from: $($selectedBackup.Name)" -ForegroundColor Yellow
+
+    try {
+        $backupData = Get-Content $selectedBackup.FullName | ConvertFrom-Json
+
+        # Restore services
+        foreach ($serviceName in $backupData.PSObject.Properties.Name) {
+            try {
+                $serviceInfo = $backupData.$serviceName
+                $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+
+                if ($service) {
+                    Set-Service -Name $serviceName -StartupType $serviceInfo.StartType -ErrorAction SilentlyContinue
+
+                    if ($serviceInfo.Status -eq "Running") {
+                        Start-Service -Name $serviceName -ErrorAction SilentlyContinue
+                    }
+
+                    Write-OptimizationLog "Restored service: $serviceName to $($serviceInfo.StartType)" "SUCCESS"
+                }
+            } catch {
+                Write-OptimizationLog "Failed to restore service $serviceName : $_" "WARNING"
+            }
+        }
+
+        # Restore registry files
+        $regBackups = Get-ChildItem -Path $script:AppConfig.BackupDir -Filter "*.reg" | Where-Object {
+            $_.LastWriteTime -ge $selectedBackup.LastWriteTime.AddMinutes(-5) -and
+            $_.LastWriteTime -le $selectedBackup.LastWriteTime.AddMinutes(5)
+        }
+
+        foreach ($regFile in $regBackups) {
+            try {
+                reg import $regFile.FullName 2>&1 | Out-Null
+                Write-OptimizationLog "Restored registry from: $($regFile.Name)" "SUCCESS"
+            } catch {
+                Write-OptimizationLog "Failed to restore registry file $($regFile.Name) : $_" "WARNING"
+            }
+        }
+
+        Write-OptimizationLog "Restore completed successfully" "SUCCESS"
+        Write-Host "`nRestore completed! Please restart your computer for changes to take full effect." -ForegroundColor Green
+        return @{ Success = $true; Message = "Restore completed" }
+
+    } catch {
+        Write-OptimizationLog "Failed to restore backup: $_" "ERROR"
+        return @{ Success = $false; Message = "Restore failed: $_" }
+    }
+}
+
+# System State Validation
+function Test-SystemState {
+    Write-OptimizationLog "Validating system state..." "INFO"
+
+    $state = @{
+        IsHealthy = $true
+        Issues = @()
+        Warnings = @()
+    }
+
+    try {
+        # Check for pending reboot
+        $rebootPending = $false
+        $rebootTests = @(
+            { Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending" },
+            { Test-Path "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired" },
+            { Test-Path "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\PendingFileRenameOperations" }
+        )
+
+        foreach ($test in $rebootTests) {
+            if (& $test) {
+                $rebootPending = $true
+                break
+            }
+        }
+
+        if ($rebootPending) {
+            $state.Warnings += "System has pending reboot - recommend rebooting before optimization"
+            Write-OptimizationLog "Pending reboot detected" "WARNING"
+        }
+
+        # Check Windows Update status
+        $updateService = Get-Service -Name wuauserv -ErrorAction SilentlyContinue
+        if ($updateService -and $updateService.Status -eq "Running") {
+            # Check if updates are in progress
+            $updateSession = New-Object -ComObject Microsoft.Update.Session -ErrorAction SilentlyContinue
+            if ($updateSession) {
+                try {
+                    $updateSearcher = $updateSession.CreateUpdateSearcher()
+                    $updateCount = $updateSearcher.GetTotalHistoryCount()
+                    if ($updateCount -gt 0) {
+                        $state.Warnings += "Windows Update service is active - may interfere with optimizations"
+                    }
+                } catch {
+                    # Silently continue if we can't check
+                }
+            }
+        }
+
+        # Check disk space
+        $systemDrive = Get-PSDrive C -ErrorAction SilentlyContinue
+        if ($systemDrive) {
+            $freeSpaceGB = [Math]::Round($systemDrive.Free / 1GB, 2)
+            if ($freeSpaceGB -lt 5) {
+                $state.Issues += "Low disk space on C: drive ($freeSpaceGB GB free) - may not be able to create backups"
+                $state.IsHealthy = $false
+                Write-OptimizationLog "Low disk space: $freeSpaceGB GB" "ERROR"
+            } elseif ($freeSpaceGB -lt 10) {
+                $state.Warnings += "Limited disk space on C: drive ($freeSpaceGB GB free)"
+                Write-OptimizationLog "Limited disk space: $freeSpaceGB GB" "WARNING"
+            }
+        }
+
+        # Check system file integrity (optional - takes time)
+        # This could be enabled with a parameter
+        # sfc /verifyonly
+
+        Write-OptimizationLog "System state validation completed" "SUCCESS"
+
+    } catch {
+        Write-OptimizationLog "Failed to validate system state: $_" "WARNING"
+        $state.Warnings += "Could not fully validate system state"
+    }
+
+    return $state
+}
+
+# Performance Benchmarking System
+function Get-PerformanceBaseline {
+    Write-OptimizationLog "Capturing performance baseline..." "INFO"
+
+    $baseline = @{
+        Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+        BootTime = $null
+        MemoryUsage = @{}
+        DiskPerformance = @{}
+        NetworkLatency = @{}
+        CPUUsage = $null
+    }
+
+    try {
+        # Get boot time
+        $os = Get-CimInstance Win32_OperatingSystem
+        $bootTime = $os.LastBootUpTime
+        $uptime = (Get-Date) - $bootTime
+        $baseline.BootTime = [Math]::Round($uptime.TotalSeconds, 2)
+
+        # Memory usage
+        $totalMemory = [Math]::Round($os.TotalVisibleMemorySize / 1MB, 2)
+        $freeMemory = [Math]::Round($os.FreePhysicalMemory / 1MB, 2)
+        $usedMemory = $totalMemory - $freeMemory
+        $baseline.MemoryUsage = @{
+            TotalGB = $totalMemory
+            UsedGB = $usedMemory
+            FreeGB = $freeMemory
+            UsagePercent = [Math]::Round(($usedMemory / $totalMemory) * 100, 2)
+        }
+
+        # CPU usage (sample over 2 seconds)
+        $cpuUsage = (Get-Counter '\Processor(_Total)\% Processor Time' -SampleInterval 2 -MaxSamples 2 |
+            Select-Object -ExpandProperty CounterSamples |
+            Select-Object -Last 1).CookedValue
+        $baseline.CPUUsage = [Math]::Round($cpuUsage, 2)
+
+        # Disk performance (read C: drive performance counter)
+        try {
+            $diskRead = (Get-Counter '\PhysicalDisk(0 C:)\Disk Read Bytes/sec' -ErrorAction SilentlyContinue |
+                Select-Object -ExpandProperty CounterSamples).CookedValue / 1MB
+            $diskWrite = (Get-Counter '\PhysicalDisk(0 C:)\Disk Write Bytes/sec' -ErrorAction SilentlyContinue |
+                Select-Object -ExpandProperty CounterSamples).CookedValue / 1MB
+            $baseline.DiskPerformance = @{
+                ReadMBps = [Math]::Round($diskRead, 2)
+                WriteMBps = [Math]::Round($diskWrite, 2)
+            }
+        } catch {
+            $baseline.DiskPerformance = @{ ReadMBps = 0; WriteMBps = 0 }
+        }
+
+        # Network latency to common DNS
+        try {
+            $ping = Test-Connection -ComputerName 8.8.8.8 -Count 4 -ErrorAction SilentlyContinue
+            if ($ping) {
+                $avgLatency = ($ping | Measure-Object -Property ResponseTime -Average).Average
+                $baseline.NetworkLatency = @{
+                    AverageMs = [Math]::Round($avgLatency, 2)
+                    Target = "8.8.8.8"
+                }
+            }
+        } catch {
+            $baseline.NetworkLatency = @{ AverageMs = 0; Target = "N/A" }
+        }
+
+        # Save baseline
+        $baselinePath = Join-Path $script:AppConfig.BackupDir "PerformanceBaseline_$(Get-Date -Format 'yyyyMMdd_HHmmss').json"
+        $baseline | ConvertTo-Json -Depth 3 | Out-File -FilePath $baselinePath -Encoding UTF8
+
+        Write-OptimizationLog "Performance baseline captured: $baselinePath" "SUCCESS"
+
+    } catch {
+        Write-OptimizationLog "Failed to capture performance baseline: $_" "WARNING"
+    }
+
+    return $baseline
+}
+
+function Compare-PerformanceBaselines {
+    param(
+        [Parameter(Mandatory=$true)]
+        [hashtable]$Before,
+
+        [Parameter(Mandatory=$true)]
+        [hashtable]$After
+    )
+
+    $comparison = @{
+        MemoryImprovement = $Before.MemoryUsage.UsagePercent - $After.MemoryUsage.UsagePercent
+        CPUImprovement = $Before.CPUUsage - $After.CPUUsage
+        Improvements = @()
+    }
+
+    if ($comparison.MemoryImprovement -gt 1) {
+        $comparison.Improvements += "Memory usage reduced by $([Math]::Round($comparison.MemoryImprovement, 2))%"
+    }
+
+    if ($comparison.CPUImprovement -gt 1) {
+        $comparison.Improvements += "CPU usage reduced by $([Math]::Round($comparison.CPUImprovement, 2))%"
+    }
+
+    return $comparison
+}
+
+# Optimization Profiles
+function Get-OptimizationProfile {
+    param(
+        [Parameter(Mandatory=$true)]
+        [ValidateSet("Gaming", "Productivity", "Privacy", "BatterySaver", "Custom")]
+        [string]$ProfileName,
+
+        [Parameter(Mandatory=$true)]
+        [hashtable]$SystemSpecs
+    )
+
+    $profiles = @{
+        Gaming = @{
+            SystemPerformance = @{ PowerPlan = $true; VisualEffects = $true; DisableGameDVR = $false }
+            Bloatware = $true
+            Services = $true
+            GPU = $true
+            Network = $true
+            Storage = $true
+            Memory = $true
+            WindowsUpdate = $false
+            Privacy = $true
+            Security = $false
+            Startup = $true
+        }
+        Productivity = @{
+            SystemPerformance = @{ PowerPlan = $true; VisualEffects = $false; DisableGameDVR = $true }
+            Bloatware = $true
+            Services = $true
+            GPU = $false
+            Network = $true
+            Storage = $true
+            Memory = $true
+            WindowsUpdate = $true
+            Privacy = $true
+            Security = $false
+            Startup = $true
+        }
+        Privacy = @{
+            SystemPerformance = @{ PowerPlan = $false; VisualEffects = $false; DisableGameDVR = $true }
+            Bloatware = $true
+            Services = $true
+            GPU = $false
+            Network = $false
+            Storage = $false
+            Memory = $false
+            WindowsUpdate = $true
+            Privacy = $true
+            Security = $false
+            Startup = $false
+        }
+        BatterySaver = @{
+            SystemPerformance = @{ PowerPlan = $true; VisualEffects = $true; DisableGameDVR = $true }
+            Bloatware = $true
+            Services = $true
+            GPU = $false
+            Network = $false
+            Storage = $true
+            Memory = $false
+            WindowsUpdate = $true
+            Privacy = $true
+            Security = $false
+            Startup = $true
+        }
+    }
+
+    return $profiles[$ProfileName]
+}
+
+#endregion
+
+#region Advanced Optimizations
+
+# Advanced Network Optimizations
+function Optimize-NetworkAdvanced {
+    param(
+        [Parameter(Mandatory=$true)]
+        [hashtable]$SystemSpecs
+    )
+
+    Write-OptimizationLog "Applying advanced network optimizations..." "INFO"
+    $changes = @()
+
+    try {
+        # Get network adapters
+        $adapters = Get-NetAdapter | Where-Object { $_.Status -eq "Up" }
+
+        foreach ($adapter in $adapters) {
+            # Configure RSS (Receive Side Scaling) for performance
+            try {
+                Set-NetAdapterRss -Name $adapter.Name -Enabled $true -ErrorAction SilentlyContinue
+                $changes += "Enabled RSS on $($adapter.Name)"
+            } catch {}
+
+            # Configure interrupt moderation
+            try {
+                Set-NetAdapterAdvancedProperty -Name $adapter.Name -DisplayName "Interrupt Moderation" -DisplayValue "Enabled" -ErrorAction SilentlyContinue
+                $changes += "Configured interrupt moderation on $($adapter.Name)"
+            } catch {}
+
+            # Disable power saving on network adapter
+            try {
+                $powerMgmt = Get-CimInstance MSPower_DeviceEnable -Namespace root/wmi -ErrorAction SilentlyContinue |
+                    Where-Object { $_.InstanceName -match [regex]::Escape($adapter.InterfaceGuid) }
+                if ($powerMgmt) {
+                    $powerMgmt.Enable = $false
+                    Set-CimInstance -InputObject $powerMgmt -ErrorAction SilentlyContinue
+                    $changes += "Disabled power saving on $($adapter.Name)"
+                }
+            } catch {}
+        }
+
+        # Configure DNS to Cloudflare (1.1.1.1) or Google (8.8.8.8)
+        Write-Host "`nOptional: Configure DNS servers? (Y/N)" -ForegroundColor Yellow
+        $configureDNS = Read-Host
+        if ($configureDNS -eq "Y" -or $configureDNS -eq "y") {
+            foreach ($adapter in $adapters) {
+                try {
+                    Set-DnsClientServerAddress -InterfaceAlias $adapter.Name -ServerAddresses ("1.1.1.1", "1.0.0.1") -ErrorAction SilentlyContinue
+                    $changes += "Configured DNS (Cloudflare) on $($adapter.Name)"
+                    Write-ChangeLog "Network" "Configured DNS on $($adapter.Name)" "" "Cloudflare (1.1.1.1)"
+                } catch {}
+            }
+        }
+
+        Write-OptimizationLog "Advanced network optimization completed. Changes: $($changes.Count)" "SUCCESS"
+
+    } catch {
+        Write-OptimizationLog "Failed to apply advanced network optimizations: $_" "WARNING"
+    }
+
+    return $changes
+}
+
+# Game Detection and Optimization
+function Optimize-Gaming {
+    param(
+        [Parameter(Mandatory=$true)]
+        [hashtable]$SystemSpecs
+    )
+
+    Write-OptimizationLog "Detecting and optimizing for gaming..." "INFO"
+    $changes = @()
+
+    try {
+        # Detect game launchers and common game directories
+        $gamePaths = @(
+            "C:\Program Files (x86)\Steam",
+            "C:\Program Files\Epic Games",
+            "C:\Program Files (x86)\Origin",
+            "C:\Program Files (x86)\Battle.net",
+            "C:\XboxGames",
+            "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Games"
+        )
+
+        $detectedGames = @()
+        foreach ($path in $gamePaths) {
+            if (Test-Path $path) {
+                $detectedGames += $path
+                Write-OptimizationLog "Detected game platform: $path" "DEBUG"
+            }
+        }
+
+        if ($detectedGames.Count -gt 0) {
+            Write-Host "`nDetected $($detectedGames.Count) game platform(s)" -ForegroundColor Green
+
+            # Enable Game Mode
+            try {
+                $gameModePath = "HKCU:\SOFTWARE\Microsoft\GameBar"
+                if (-not (Test-Path $gameModePath)) {
+                    New-Item -Path $gameModePath -Force | Out-Null
+                }
+                Set-ItemProperty -Path $gameModePath -Name "AutoGameModeEnabled" -Type DWord -Value 1 -ErrorAction SilentlyContinue
+                $changes += "Enabled Windows Game Mode"
+                Write-ChangeLog "Gaming" "Enabled Game Mode" "" "Enabled"
+            } catch {}
+
+            # Disable fullscreen optimizations for better FPS
+            try {
+                $dwmPath = "HKCU:\System\GameConfigStore"
+                if (-not (Test-Path $dwmPath)) {
+                    New-Item -Path $dwmPath -Force | Out-Null
+                }
+                Set-ItemProperty -Path $dwmPath -Name "GameDVR_FSEBehaviorMode" -Type DWord -Value 2 -ErrorAction SilentlyContinue
+                $changes += "Optimized fullscreen mode"
+            } catch {}
+
+            # Set high priority for games (note: this is a recommendation, not automatic)
+            Write-ChangeLog "Gaming" "Gaming optimizations applied" "" "$($changes.Count) changes"
+        } else {
+            Write-OptimizationLog "No game platforms detected" "INFO"
+        }
+
+        Write-OptimizationLog "Gaming optimization completed" "SUCCESS"
+
+    } catch {
+        Write-OptimizationLog "Failed to optimize gaming settings: $_" "WARNING"
+    }
+
+    return $changes
+}
+
+# Storage Management and Cleanup
+function Optimize-StorageAdvanced {
+    param(
+        [Parameter(Mandatory=$true)]
+        [hashtable]$SystemSpecs
+    )
+
+    Write-OptimizationLog "Performing advanced storage optimization..." "INFO"
+    $changes = @()
+
+    try {
+        # Clean temporary files
+        Write-Host "`nClean temporary files? (Y/N)" -ForegroundColor Yellow
+        $cleanTemp = Read-Host
+        if ($cleanTemp -eq "Y" -or $cleanTemp -eq "y") {
+            $tempPaths = @(
+                $env:TEMP,
+                "C:\Windows\Temp",
+                "C:\Windows\Prefetch"
+            )
+
+            $totalCleaned = 0
+            foreach ($path in $tempPaths) {
+                if (Test-Path $path) {
+                    try {
+                        $before = (Get-ChildItem $path -Recurse -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum / 1GB
+                        Get-ChildItem $path -Recurse -ErrorAction SilentlyContinue | Remove-Item -Force -Recurse -ErrorAction SilentlyContinue
+                        $after = (Get-ChildItem $path -Recurse -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum / 1GB
+                        $cleaned = $before - $after
+                        $totalCleaned += $cleaned
+                    } catch {}
+                }
+            }
+
+            if ($totalCleaned -gt 0) {
+                $changes += "Cleaned $([Math]::Round($totalCleaned, 2)) GB of temporary files"
+                Write-ChangeLog "Storage" "Cleaned temporary files" "" "$([Math]::Round($totalCleaned, 2)) GB freed"
+            }
+        }
+
+        # Configure Storage Sense
+        try {
+            $storageSensePath = "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\StorageSense\Parameters\StoragePolicy"
+            if (-not (Test-Path $storageSensePath)) {
+                New-Item -Path $storageSensePath -Force | Out-Null
+            }
+            Set-ItemProperty -Path $storageSensePath -Name "01" -Type DWord -Value 1 -ErrorAction SilentlyContinue
+            Set-ItemProperty -Path $storageSensePath -Name "StoragePoliciesNotified" -Type DWord -Value 1 -ErrorAction SilentlyContinue
+            $changes += "Enabled Storage Sense"
+            Write-ChangeLog "Storage" "Configured Storage Sense" "" "Enabled"
+        } catch {}
+
+        Write-OptimizationLog "Advanced storage optimization completed. Changes: $($changes.Count)" "SUCCESS"
+
+    } catch {
+        Write-OptimizationLog "Failed to perform advanced storage optimization: $_" "WARNING"
+    }
+
     return $changes
 }
 
@@ -1262,6 +1851,289 @@ function Start-CLIInterface {
 #endregion
 
 #region Summary and Reporting
+
+function Generate-HTMLReport {
+    param(
+        [Parameter(Mandatory=$true)]
+        [hashtable]$SystemSpecs,
+
+        [Parameter(Mandatory=$false)]
+        [hashtable]$BeforePerformance = $null,
+
+        [Parameter(Mandatory=$false)]
+        [hashtable]$AfterPerformance = $null
+    )
+
+    Write-OptimizationLog "Generating HTML report..." "INFO"
+
+    $htmlContent = @"
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Windows Optimization Report - $(Get-Date -Format 'yyyy-MM-dd')</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            padding: 20px;
+            color: #333;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 15px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            overflow: hidden;
+        }
+        .header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 40px;
+            text-align: center;
+        }
+        .header h1 {
+            font-size: 2.5em;
+            margin-bottom: 10px;
+        }
+        .header p {
+            font-size: 1.2em;
+            opacity: 0.9;
+        }
+        .content {
+            padding: 40px;
+        }
+        .section {
+            margin-bottom: 40px;
+        }
+        .section h2 {
+            color: #667eea;
+            border-bottom: 3px solid #667eea;
+            padding-bottom: 10px;
+            margin-bottom: 20px;
+            font-size: 1.8em;
+        }
+        .info-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+        .info-card {
+            background: #f8f9fa;
+            padding: 20px;
+            border-radius: 10px;
+            border-left: 4px solid #667eea;
+        }
+        .info-card h3 {
+            color: #667eea;
+            margin-bottom: 10px;
+            font-size: 1.1em;
+        }
+        .info-card p {
+            color: #555;
+            font-size: 0.95em;
+            line-height: 1.6;
+        }
+        .performance-comparison {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+            margin: 20px 0;
+        }
+        .perf-box {
+            background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
+            color: white;
+            padding: 25px;
+            border-radius: 10px;
+            text-align: center;
+        }
+        .perf-box.improvement {
+            background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
+        }
+        .perf-box h3 {
+            font-size: 1.3em;
+            margin-bottom: 10px;
+        }
+        .perf-box .value {
+            font-size: 2.5em;
+            font-weight: bold;
+            margin: 10px 0;
+        }
+        .changes-list {
+            background: #f8f9fa;
+            padding: 20px;
+            border-radius: 10px;
+        }
+        .change-item {
+            padding: 12px;
+            margin: 8px 0;
+            background: white;
+            border-left: 4px solid #28a745;
+            border-radius: 5px;
+        }
+        .footer {
+            background: #2d3748;
+            color: white;
+            padding: 30px;
+            text-align: center;
+        }
+        .badge {
+            display: inline-block;
+            padding: 5px 15px;
+            border-radius: 20px;
+            font-size: 0.85em;
+            font-weight: bold;
+            margin: 5px;
+        }
+        .badge-success { background: #28a745; color: white; }
+        .badge-info { background: #17a2b8; color: white; }
+        .badge-warning { background: #ffc107; color: #333; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>Windows Optimization Report</h1>
+            <p>Generated on $(Get-Date -Format 'MMMM dd, yyyy HH:mm:ss')</p>
+            <p>Script Version: $($script:AppConfig.Version)</p>
+        </div>
+
+        <div class="content">
+            <div class="section">
+                <h2>System Information</h2>
+                <div class="info-grid">
+                    <div class="info-card">
+                        <h3>Processor</h3>
+                        <p><strong>$($SystemSpecs.CPU.Name)</strong></p>
+                        <p>$($SystemSpecs.CPU.Cores) Cores / $($SystemSpecs.CPU.Threads) Threads</p>
+                        <p>$($SystemSpecs.CPU.Architecture) Architecture</p>
+                    </div>
+                    <div class="info-card">
+                        <h3>Memory</h3>
+                        <p><strong>$($SystemSpecs.RAM.TotalGB) GB Total</strong></p>
+                        <p>$($SystemSpecs.RAM.AvailableGB) GB Available</p>
+                        <p>$($SystemSpecs.RAM.InstalledModules.Count) Module(s)</p>
+                    </div>
+                    <div class="info-card">
+                        <h3>Graphics</h3>
+                        <p><strong>$($SystemSpecs.GPU.Primary)</strong></p>
+                        <p>$(if ($SystemSpecs.GPU.NVIDIA) { '<span class="badge badge-success">NVIDIA</span>' })$(if ($SystemSpecs.GPU.AMD) { '<span class="badge badge-success">AMD</span>' })$(if ($SystemSpecs.GPU.Intel) { '<span class="badge badge-info">Intel</span>' })</p>
+                    </div>
+                    <div class="info-card">
+                        <h3>Operating System</h3>
+                        <p><strong>$($SystemSpecs.OS.Name)</strong></p>
+                        <p>Build $($SystemSpecs.OS.Build)</p>
+                        <p>Edition: $($SystemSpecs.OS.Edition)</p>
+                    </div>
+                    <div class="info-card">
+                        <h3>Storage</h3>
+                        <p>$(if ($SystemSpecs.Storage.HasNVMe) { '<span class="badge badge-success">NVMe</span>' })$(if ($SystemSpecs.Storage.HasSSD) { '<span class="badge badge-success">SSD</span>' })$(if ($SystemSpecs.Storage.HasHDD) { '<span class="badge badge-info">HDD</span>' })</p>
+                        <p>$($SystemSpecs.Storage.Drives.Count) Drive(s)</p>
+                    </div>
+                    <div class="info-card">
+                        <h3>System Type</h3>
+                        <p><strong>$(if ($SystemSpecs.SystemType.IsLaptop) { 'Laptop' } else { 'Desktop' })</strong></p>
+                        <p>$(if ($SystemSpecs.SystemType.HasBattery) { 'Battery: Yes' } else { 'Battery: No' })</p>
+                    </div>
+                </div>
+            </div>
+
+            $(if ($BeforePerformance -and $AfterPerformance) {
+                $comparison = Compare-PerformanceBaselines -Before $BeforePerformance -After $AfterPerformance
+                @"
+            <div class="section">
+                <h2>Performance Improvements</h2>
+                <div class="performance-comparison">
+                    <div class="perf-box">
+                        <h3>Before Optimization</h3>
+                        <div class="value">$($BeforePerformance.MemoryUsage.UsagePercent)%</div>
+                        <p>Memory Usage</p>
+                    </div>
+                    <div class="perf-box improvement">
+                        <h3>After Optimization</h3>
+                        <div class="value">$($AfterPerformance.MemoryUsage.UsagePercent)%</div>
+                        <p>Memory Usage</p>
+                    </div>
+                </div>
+                <div class="performance-comparison">
+                    <div class="perf-box">
+                        <h3>CPU Usage (Before)</h3>
+                        <div class="value">$($BeforePerformance.CPUUsage)%</div>
+                    </div>
+                    <div class="perf-box improvement">
+                        <h3>CPU Usage (After)</h3>
+                        <div class="value">$($AfterPerformance.CPUUsage)%</div>
+                    </div>
+                </div>
+                $(if ($comparison.Improvements.Count -gt 0) {
+                    "<div class='changes-list'><h3>Measured Improvements:</h3>"
+                    foreach ($imp in $comparison.Improvements) {
+                        "<div class='change-item'>$imp</div>"
+                    }
+                    "</div>"
+                })
+            </div>
+"@
+            })
+
+            <div class="section">
+                <h2>Optimizations Applied</h2>
+                <div class="changes-list">
+                    $(if (Test-Path $script:AppConfig.ChangesLog) {
+                        $changes = Get-Content $script:AppConfig.ChangesLog -ErrorAction SilentlyContinue | Select-Object -Last 50
+                        if ($changes) {
+                            foreach ($change in $changes) {
+                                "<div class='change-item'>$change</div>"
+                            }
+                        } else {
+                            "<p>No recent changes recorded.</p>"
+                        }
+                    } else {
+                        "<p>Changes log not found.</p>"
+                    })
+                </div>
+            </div>
+
+            <div class="section">
+                <h2>Next Steps</h2>
+                <div class="info-card">
+                    <h3>Recommended Actions</h3>
+                    <p>1. <strong>Restart your computer</strong> for all changes to take full effect</p>
+                    <p>2. Monitor system performance and stability over the next few days</p>
+                    <p>3. Review the changes log: <code>$($script:AppConfig.ChangesLog)</code></p>
+                    <p>4. If you experience issues, use the Restore function or System Restore</p>
+                    <p>5. Backups are stored in: <code>$($script:AppConfig.BackupDir)</code></p>
+                </div>
+            </div>
+        </div>
+
+        <div class="footer">
+            <p><strong>Windows Optimization Script v$($script:AppConfig.Version)</strong></p>
+            <p>Generated with care by the Windows Optimization Team</p>
+            <p>For support, check the log files in: $($script:AppConfig.LogFile)</p>
+        </div>
+    </div>
+</body>
+</html>
+"@
+
+    try {
+        $htmlContent | Out-File -FilePath $script:AppConfig.HTMLReport -Encoding UTF8
+        Write-OptimizationLog "HTML report generated: $($script:AppConfig.HTMLReport)" "SUCCESS"
+
+        # Open the report in default browser
+        Start-Process $script:AppConfig.HTMLReport
+
+    } catch {
+        Write-OptimizationLog "Failed to generate HTML report: $_" "WARNING"
+    }
+
+    return $script:AppConfig.HTMLReport
+}
 
 function Generate-OptimizationSummary {
     param(
