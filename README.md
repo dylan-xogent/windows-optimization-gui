@@ -45,15 +45,16 @@
 
 ## 🚀 Quick Start
 
-### Method 1: Launch from GitHub
+### Method 1: Download, review, run
 
-Run this command in an **elevated** PowerShell window:
+This script changes system settings, so read it before you run it. In an **elevated** PowerShell window:
 
 ```powershell
-iex (irm 'https://raw.githubusercontent.com/[user]/[repo]/main/windows-optimization-gui.ps1')
+git clone https://github.com/dylan-xogent/windows-optimization-gui.git
+cd windows-optimization-gui
+# Review windows-optimization-gui.ps1, then:
+powershell -ExecutionPolicy Bypass -File .\windows-optimization-gui.ps1
 ```
-
-**Note**: Replace `[user]` and `[repo]` with your GitHub username and repository name.
 
 ### Method 2: Local Installation
 
@@ -530,14 +531,9 @@ Need help? Here's how to get support:
 
 ---
 
-## 🎉 Get Started Now!
+## 🎉 Get Started
 
-```powershell
-# Copy and paste this into an elevated PowerShell window:
-iex (irm 'https://raw.githubusercontent.com/[user]/[repo]/main/windows-optimization-gui.ps1')
-```
-
-**Remember to replace `[user]` and `[repo]` with your GitHub details!**
+See [Quick Start](#-quick-start) above. Every run creates a backup first, so you can roll back any change.
 
 ---
 
