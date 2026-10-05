@@ -533,7 +533,7 @@ Need help? Here's how to get support:
 
 ## 🎉 Get Started
 
-See [Quick Start](#-quick-start) above. Every run creates a backup first, so you can roll back any change.
+See [Quick Start](#-quick-start) above. The script includes backup and restore options for the changes it makes.
 
 ---
 
